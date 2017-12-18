@@ -2,7 +2,16 @@ import logging
 from enum import Enum
 
 from eth_utils import decode_hex, is_same_address
-from microraiden.crypto import sign_balance_proof, verify_closing_sig
+from typing import Callable
+
+from microraiden.client.context import Context
+from microraiden.utils import (
+    get_event_blocking,
+    create_signed_contract_transaction,
+    sign_balance_proof,
+    verify_closing_sig,
+    keccak256
+)
 
 log = logging.getLogger(__name__)
 
@@ -15,56 +24,41 @@ class Channel:
 
     def __init__(
             self,
-            client,
+            core: Context,
             sender: str,
             receiver: str,
             block: int,
-            deposit=0,
-            balance=0,
-            state=State.open
+            deposit: int = 0,
+            balance: int = 0,
+            state: State = State.open,
+            on_settle: Callable[['Channel'], None] = lambda channel: None
     ):
         self._balance = 0
         self._balance_sig = None
 
-        self.client = client
+        self.core = core
         self.sender = sender.lower()
         self.receiver = receiver.lower()
         self.deposit = deposit
         self.block = block
-        self.balance = balance
+        self.update_balance(balance)
         self.state = state
+        self.on_settle = on_settle
 
         assert self.block is not None
         assert self._balance_sig
-
-    @staticmethod
-    def deserialize(client, channels_raw: dict):
-        return [
-            Channel(client, craw['sender'], craw['receiver'], craw['block'], craw['balance'])
-            for craw in channels_raw
-        ]
-
-    @staticmethod
-    def serialize(channels):
-        return [
-            {
-                'sender': c.sender,
-                'receiver': c.receiver,
-                'block': c.block,
-                'balance': c.balance
-
-            } for c in channels
-        ]
 
     @property
     def balance(self):
         return self._balance
 
-    @balance.setter
-    def balance(self, value):
+    @property
+    def key(self) -> bytes:
+        return keccak256(self.sender, self.receiver, self.block)
+
+    def update_balance(self, value):
         self._balance = value
         self._balance_sig = self.sign()
-        self.client.store_channels()
 
     @property
     def balance_sig(self):
@@ -72,11 +66,11 @@ class Channel:
 
     def sign(self):
         return sign_balance_proof(
-            self.client.privkey,
+            self.core.private_key,
             self.receiver,
             self.block,
             self.balance,
-            self.client.channel_manager_address
+            self.core.channel_manager.address
         )
 
     def topup(self, deposit):
@@ -87,37 +81,47 @@ class Channel:
             log.error('Channel must be open to be topped up.')
             return
 
-        token_balance = self.client.token_proxy.contract.call().balanceOf(self.client.account)
+        token_balance = self.core.token.call().balanceOf(self.core.address)
         if token_balance < deposit:
             log.error(
                 'Insufficient tokens available for the specified topup ({}/{})'
                 .format(token_balance, deposit)
             )
+            return None
 
         log.info('Topping up channel to {} created at block #{} by {} tokens.'.format(
             self.receiver, self.block, deposit
         ))
-        current_block = self.client.web3.eth.blockNumber
+        current_block = self.core.web3.eth.blockNumber
 
         data = decode_hex(self.receiver) + self.block.to_bytes(4, byteorder='big')
-        tx = self.client.token_proxy.create_signed_transaction(
-            'transfer', [self.client.channel_manager_address, deposit, data]
+        tx = create_signed_contract_transaction(
+            self.core.private_key,
+            self.core.token,
+            'transfer',
+            [
+                self.core.channel_manager.address,
+                deposit,
+                data
+            ]
         )
-        self.client.web3.eth.sendRawTransaction(tx)
+        self.core.web3.eth.sendRawTransaction(tx)
 
-        log.info('Waiting for topup confirmation event...')
-        event = self.client.channel_manager_proxy.get_channel_topped_up_event_blocking(
-            self.sender,
-            self.receiver,
-            self.block,
-            deposit,
-            current_block + 1
+        log.debug('Waiting for topup confirmation event...')
+        event = get_event_blocking(
+            self.core.channel_manager,
+            'ChannelToppedUp',
+            from_block=current_block + 1,
+            argument_filters={
+                '_sender': self.sender,
+                '_receiver': self.receiver,
+                '_open_block_number': self.block
+            }
         )
 
         if event:
-            log.info('Successfully topped up channel in block {}.'.format(event['blockNumber']))
+            log.debug('Successfully topped up channel in block {}.'.format(event['blockNumber']))
             self.deposit += deposit
-            self.client.store_channels()
             return event
         else:
             log.error('No event received.')
@@ -134,27 +138,41 @@ class Channel:
         log.info('Requesting close of channel to {} created at block #{}.'.format(
             self.receiver, self.block
         ))
-        current_block = self.client.web3.eth.blockNumber
+        current_block = self.core.web3.eth.blockNumber
 
         if balance is not None:
-            self.balance = balance
+            self.update_balance(balance)
 
-        tx = self.client.channel_manager_proxy.create_signed_transaction(
-            'uncooperativeClose', [self.receiver, self.block, self.balance, self.balance_sig]
+        tx = create_signed_contract_transaction(
+            self.core.private_key,
+            self.core.channel_manager,
+            'uncooperativeClose',
+            [
+                self.receiver,
+                self.block,
+                self.balance,
+                self.balance_sig
+            ]
         )
-        self.client.web3.eth.sendRawTransaction(tx)
+        self.core.web3.eth.sendRawTransaction(tx)
 
-        log.info('Waiting for close confirmation event...')
-        event = self.client.channel_manager_proxy.get_channel_close_requested_event_blocking(
-            self.sender, self.receiver, self.block, current_block + 1
+        log.debug('Waiting for close confirmation event...')
+        event = get_event_blocking(
+            self.core.channel_manager,
+            'ChannelCloseRequested',
+            from_block=current_block + 1,
+            argument_filters={
+                '_sender': self.sender,
+                '_receiver': self.receiver,
+                '_open_block_number': self.block
+            }
         )
 
         if event:
-            log.info('Successfully sent channel close request in block {}.'.format(
+            log.debug('Successfully sent channel close request in block {}.'.format(
                 event['blockNumber']
             ))
             self.state = Channel.State.settling
-            self.client.store_channels()
             return event
         else:
             log.error('No event received.')
@@ -172,26 +190,40 @@ class Channel:
         log.info('Attempting to cooperatively close channel to {} created at block #{}.'.format(
             self.receiver, self.block
         ))
-        current_block = self.client.web3.eth.blockNumber
+        current_block = self.core.web3.eth.blockNumber
         if not is_same_address(verify_closing_sig(self.balance_sig, closing_sig), self.receiver):
             log.error('Invalid closing signature.')
             return None
 
-        tx = self.client.channel_manager_proxy.create_signed_transaction(
+        tx = create_signed_contract_transaction(
+            self.core.private_key,
+            self.core.channel_manager,
             'cooperativeClose',
-            [self.receiver, self.block, self.balance, self.balance_sig, closing_sig]
+            [
+                self.receiver,
+                self.block,
+                self.balance,
+                self.balance_sig,
+                closing_sig
+            ]
         )
-        self.client.web3.eth.sendRawTransaction(tx)
+        self.core.web3.eth.sendRawTransaction(tx)
 
-        log.info('Waiting for settle confirmation event...')
-        event = self.client.channel_manager_proxy.get_channel_settle_event_blocking(
-            self.sender, self.receiver, self.block, current_block + 1
+        log.debug('Waiting for settle confirmation event...')
+        event = get_event_blocking(
+            self.core.channel_manager,
+            'ChannelSettled',
+            from_block=current_block + 1,
+            argument_filters={
+                '_sender': self.sender,
+                '_receiver': self.receiver,
+                '_open_block_number': self.block
+            }
         )
 
         if event:
-            log.info('Successfully closed channel in block {}.'.format(event['blockNumber']))
+            log.debug('Successfully closed channel in block {}.'.format(event['blockNumber']))
             self.state = Channel.State.closed
-            self.client.store_channels()
             return event
         else:
             log.error('No event received.')
@@ -210,11 +242,11 @@ class Channel:
             self.receiver, self.block
         ))
 
-        _, _, settle_block, _ = self.client.channel_manager_proxy.contract.call().getChannelInfo(
+        _, _, settle_block, _ = self.core.channel_manager.call().getChannelInfo(
             self.sender, self.receiver, self.block
         )
 
-        current_block = self.client.web3.eth.blockNumber
+        current_block = self.core.web3.eth.blockNumber
         wait_remaining = settle_block - current_block
         if wait_remaining > 0:
             log.warning('{} more blocks until this channel can be settled. Aborting.'.format(
@@ -222,21 +254,33 @@ class Channel:
             ))
             return None
 
-        tx = self.client.channel_manager_proxy.create_signed_transaction(
-            'settle', [self.receiver, self.block]
+        tx = create_signed_contract_transaction(
+            self.core.private_key,
+            self.core.channel_manager,
+            'settle',
+            [
+                self.receiver,
+                self.block
+            ]
         )
-        self.client.web3.eth.sendRawTransaction(tx)
+        self.core.web3.eth.sendRawTransaction(tx)
 
-        log.info('Waiting for settle confirmation event...')
-        event = self.client.channel_manager_proxy.get_channel_settle_event_blocking(
-            self.sender, self.receiver, self.block, current_block + 1
+        log.debug('Waiting for settle confirmation event...')
+        event = get_event_blocking(
+            self.core.channel_manager,
+            'ChannelSettled',
+            from_block=current_block + 1,
+            argument_filters={
+                '_sender': self.sender,
+                '_receiver': self.receiver,
+                '_open_block_number': self.block
+            }
         )
 
         if event:
-            log.info('Successfully settled channel in block {}.'.format(event['blockNumber']))
+            log.debug('Successfully settled channel in block {}.'.format(event['blockNumber']))
             self.state = Channel.State.closed
-            self.client.channels.remove(self)
-            self.client.store_channels()
+            self.on_settle(self)
             return event
         else:
             log.error('No event received.')
@@ -255,7 +299,7 @@ class Channel:
             )
             return None
 
-        log.info('Signing new transfer of value {} on channel to {} created at block #{}.'.format(
+        log.debug('Signing new transfer of value {} on channel to {} created at block #{}.'.format(
             value, self.receiver, self.block
         ))
 
@@ -263,9 +307,7 @@ class Channel:
             log.error('Channel must be open to create a transfer.')
             return None
 
-        self.balance += value
-
-        self.client.store_channels()
+        self.update_balance(self.balance + value)
 
         return self.balance_sig
 

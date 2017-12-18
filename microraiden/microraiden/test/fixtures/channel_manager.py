@@ -20,6 +20,7 @@ def start_channel_manager(channel_manager, use_tester, mine_sync_event):
         def stop_patched(self: ChannelManager):
             mine_sync_event.set()
             ChannelManager.stop(self)
+            self.stop = types.MethodType(ChannelManager.stop, self)
 
         channel_manager.stop = types.MethodType(
             stop_patched, channel_manager)
@@ -33,16 +34,25 @@ def start_channel_manager(channel_manager, use_tester, mine_sync_event):
 
 
 @pytest.fixture
-def channel_manager(web3, receiver_privkey, make_channel_manager_proxy, token_contract, use_tester,
-                    mine_sync_event, state_db_path):
-    if use_tester:
-        snapshot_id = web3.testing.snapshot()
-    contract_proxy = make_channel_manager_proxy(receiver_privkey)
-    manager = ChannelManager(web3, contract_proxy, token_contract, receiver_privkey,
-                             n_confirmations=5, state_filename=state_db_path)
+def channel_manager(
+        web3,
+        receiver_privkey,
+        channel_manager_contract,
+        token_contract,
+        use_tester,
+        mine_sync_event,
+        state_db_path,
+        patched_contract,
+        revert_chain
+):
+    manager = ChannelManager(
+        web3,
+        channel_manager_contract,
+        token_contract,
+        receiver_privkey,
+        n_confirmations=5,
+        state_filename=state_db_path
+    )
     start_channel_manager(manager, use_tester, mine_sync_event)
     yield manager
-    manager.stop()
-    if use_tester:
-        web3.testing.revert(snapshot_id)
     manager.stop()

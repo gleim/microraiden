@@ -1,10 +1,13 @@
-# µRaiden
+# µRaiden [![Build Status](https://api.travis-ci.org/raiden-network/microraiden.svg)](https://travis-ci.org/raiden-network/microraiden)
 
 
 µRaiden is an off-chain, cheap, scalable and low-latency micropayment solution.
 
 
 ## Smart Contract
+
+Current version: `0.1.0`. Verifiable with `RaidenMicroTransferChannels.call().version()`.
+Note that a new µRaiden release might include changing the Ethereum address used for the smart contract, in case we need to deploy an improved contract version.
 
 The `RaidenMicroTransferChannels` contract has been deployed on the main net: https://etherscan.io/address/0x4d6e0922e6b703f0fdf92745343a9b83eb656402
 
@@ -139,3 +142,4 @@ You can use the configuration for the above default example for creating your ow
  * Components Overview: [/docs/dev_overview.md](/docs/dev_overview.md)
  * µRaiden Service Setup: [/microraiden/README.md](/microraiden/README.md)
  * Smart Contracts Setup: [/contracts/README.md](/contracts/README.md)
+ * JS/TS client library: [NPM package README.md](/microraiden/microraiden/webui/microraiden/README.md)

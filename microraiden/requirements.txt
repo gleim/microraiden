@@ -1,11 +1,11 @@
+ethereum-utils<0.5.0
+ethereum-abi-utils==0.4.0
 coincurve
 rlp>=0.4.3,<0.6.0
 flask
 flask_httpauth
 flask_restful
-pytest
 ethereum<2.0.0,>=1.6.1
-ethereum-tester
 web3==3.11.1
 gevent
 click

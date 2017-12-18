@@ -9,11 +9,15 @@ from eth_utils import (
     decode_hex,
     is_same_address
 )
+from ethereum.exceptions import InsufficientBalance
+from web3 import Web3
+from web3.contract import Contract
 
-from microraiden.crypto import (
+from microraiden.utils import (
     verify_balance_proof,
     privkey_to_addr,
-    sign_close
+    sign_close,
+    create_signed_contract_transaction
 )
 from microraiden.exceptions import (
     NetworkIdMismatch,
@@ -24,11 +28,13 @@ from microraiden.exceptions import (
     InsufficientConfirmations,
     InvalidBalanceProof,
     InvalidBalanceAmount,
+    InvalidContractVersion,
     NoBalanceProofReceived,
 )
+from microraiden.config import CHANNEL_MANAGER_CONTRACT_VERSION
 from .state import ChannelManagerState
 from .blockchain import Blockchain
-from .channel import Channel
+from .channel import Channel, ChannelState
 
 log = logging.getLogger(__name__)
 
@@ -36,27 +42,43 @@ log = logging.getLogger(__name__)
 class ChannelManager(gevent.Greenlet):
     """Manages channels from the receiver's point of view."""
 
-    def __init__(self, web3, contract_proxy, token_contract, private_key: str,
-                 state_filename=None, n_confirmations=1) -> None:
+    def __init__(
+            self,
+            web3: Web3,
+            channel_manager_contract: Contract,
+            token_contract: Contract,
+            private_key: str,
+            state_filename: str = None,
+            n_confirmations=1
+    ) -> None:
         gevent.Greenlet.__init__(self)
-        self.blockchain = Blockchain(web3, contract_proxy, self, n_confirmations=n_confirmations)
+        self.blockchain = Blockchain(
+            web3,
+            channel_manager_contract,
+            self,
+            n_confirmations=n_confirmations
+        )
         self.receiver = privkey_to_addr(private_key)
         self.private_key = private_key
-        self.contract_proxy = contract_proxy
+        self.channel_manager_contract = channel_manager_contract
         self.token_contract = token_contract
         self.n_confirmations = n_confirmations
         self.log = logging.getLogger('channel_manager')
         network_id = web3.version.network
         assert privkey_to_addr(self.private_key) == self.receiver.lower()
 
-        channel_contract_address = contract_proxy.contract.address
+        # check contract version
+        self.check_contract_version()
+
         if state_filename not in (None, ':memory:') and os.path.isfile(state_filename):
             self.state = ChannelManagerState.load(state_filename)
         else:
             self.state = ChannelManagerState(state_filename)
-            self.state.setup_db(network_id,
-                                channel_contract_address,
-                                self.receiver)
+            self.state.setup_db(
+                network_id,
+                channel_manager_contract.address,
+                self.receiver
+            )
 
         assert self.state is not None
         if state_filename not in (None, ':memory:'):
@@ -74,12 +96,12 @@ class ChannelManager(gevent.Greenlet):
         if not is_same_address(self.receiver, self.state.receiver):
             raise StateReceiverAddrMismatch('%s != %s' %
                                             (self.receiver.lower(), self.state.receiver))
-        if not is_same_address(self.state.contract_address, channel_contract_address):
+        if not is_same_address(self.state.contract_address, channel_manager_contract.address):
             raise StateContractAddrMismatch('%s != %s' % (
-                channel_contract_address.lower(), self.state.contract_address.lower()))
+                channel_manager_contract.address.lower(), self.state.contract_address.lower()))
 
         self.log.debug('setting up channel manager, receiver=%s channel_contract=%s' %
-                       (self.receiver, channel_contract_address))
+                       (self.receiver, channel_manager_contract.address))
 
     def __del__(self):
         self.stop()
@@ -108,6 +130,7 @@ class ChannelManager(gevent.Greenlet):
             return  # ignore event if already provessed
         c = Channel(self.state.receiver, sender, deposit, open_block_number)
         c.confirmed = True
+        c.state = ChannelState.OPEN
         self.log.info('new channel opened (sender %s, block number %s)', sender, open_block_number)
         self.state.set_channel(c)
 
@@ -119,6 +142,7 @@ class ChannelManager(gevent.Greenlet):
             return
         c = Channel(self.state.receiver, sender, deposit, open_block_number)
         c.confirmed = False
+        c.state = ChannelState.OPEN
         self.state.set_channel(c)
         self.log.info('unconfirmed channel event received (sender %s, block_number %s)',
                       sender, open_block_number)
@@ -135,8 +159,9 @@ class ChannelManager(gevent.Greenlet):
             return
         c = self.channels[sender, open_block_number]
         if c.balance > balance:
-            self.log.info('sender tried to cheat, sending challenge (sender %s, block number %s)',
-                          sender, open_block_number)
+            self.log.warning('sender tried to cheat, sending challenge '
+                             '(sender %s, block number %s)',
+                             sender, open_block_number)
             self.close_channel(sender, open_block_number)  # dispute by closing the channel
         else:
             self.log.info('valid channel close request received '
@@ -204,17 +229,31 @@ class ChannelManager(gevent.Greenlet):
         if c.last_signature is None:
             raise NoBalanceProofReceived('Cannot close a channel without a balance proof.')
         # send closing tx
-        tx_params = [self.state.receiver, open_block_number,
-                     c.balance, decode_hex(c.last_signature)]
-        raw_tx = self.contract_proxy.create_signed_transaction('uncooperativeClose', tx_params)
+        raw_tx = create_signed_contract_transaction(
+            self.private_key,
+            self.channel_manager_contract,
+            'uncooperativeClose',
+            [
+                self.state.receiver,
+                open_block_number,
+                c.balance,
+                decode_hex(c.last_signature)
+            ]
+        )
 
-        txid = self.blockchain.web3.eth.sendRawTransaction(raw_tx)
-        self.log.info('sent channel close(sender %s, block number %s, tx %s)',
-                      sender, open_block_number, txid)
         # update local state
         c.is_closed = True
         c.mtime = time.time()
         self.state.set_channel(c)
+
+        try:
+            txid = self.blockchain.web3.eth.sendRawTransaction(raw_tx)
+            self.log.info('sent channel close(sender %s, block number %s, tx %s)',
+                          sender, open_block_number, txid)
+        except InsufficientBalance:
+            c.state = ChannelState.CLOSE_PENDING
+            self.state.set_channel(c)
+            raise
 
     def force_close_channel(self, sender, open_block_number):
         """Forcibly remove a channel from our channel state"""
@@ -256,6 +295,10 @@ class ChannelManager(gevent.Greenlet):
         balance = self.token_contract.call().balanceOf(self.receiver)
         return balance
 
+    def get_eth_balance(self):
+        """Get eth balance of the receiver"""
+        return self.channel_manager_contract.web3.eth.getBalance(self.receiver)
+
     def verify_balance_proof(self, sender, open_block_number, balance, signature):
         """Verify that a balance proof is valid and return the sender.
 
@@ -281,7 +324,7 @@ class ChannelManager(gevent.Greenlet):
                     open_block_number,
                     balance,
                     decode_hex(signature),
-                    self.contract_proxy.contract.address
+                    self.channel_manager_contract.address
                 ),
                 sender
         ):
@@ -320,6 +363,10 @@ class ChannelManager(gevent.Greenlet):
     @property
     def unconfirmed_channels(self):
         return self.state.unconfirmed_channels
+
+    @property
+    def pending_channels(self):
+        return self.state.pending_channels
 
     def channels_to_dict(self):
         """Export all channels as a dictionary."""
@@ -362,3 +409,17 @@ class ChannelManager(gevent.Greenlet):
 
     def get_token_address(self):
         return self.token_contract.address
+
+    def check_contract_version(self):
+        deployed_contract_version = self.channel_manager_contract.call().version()
+        if deployed_contract_version != CHANNEL_MANAGER_CONTRACT_VERSION:
+            raise InvalidContractVersion("Incompatible contract version: expected=%s deployed=%s" %
+                                         (CHANNEL_MANAGER_CONTRACT_VERSION,
+                                          deployed_contract_version))
+
+    def close_pending_channels(self):
+        """Close all channels that are in CLOSE_PENDING state.
+        This state happens if the receiver's eth balance is not enough to
+            close channel on-chain."""
+        for sender, open_block_number in self.pending_channels.keys():
+            self.close_channel(sender, open_block_number)  # dispute by closing the channel
