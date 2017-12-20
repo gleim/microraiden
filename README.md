@@ -86,22 +86,6 @@ virtualenv -p python3 env
 pip install -e microraiden
 ```
 
-* if necessary to complete the build, install latest OpenSSL on MacOS
-
-```
-brew update
-brew upgrade openssl
-```
-
-* additional dependency-related build steps on MacOS as necessary:
-
-```
-export CPPFLAGS="-I/usr/local/opt/openssl/include $CPPFLAGS"
-brew install automake
-export LDFLAGS="-L/usr/local/opt/openssl/lib"
-brew install libtool
-```
-
 * install the WebUI component for the paywall examples
 
 Note that while the `RaidenMicroTransferChannels` contract supports multiple open channels between a sender and a receiver, the WebUI component only supports one.
@@ -125,6 +109,24 @@ python -m microraiden.examples.demo_proxy --private-key <private_key_file> start
 
  * Go to the paywalled resource pages:
     - http://localhost:5000/doggo.jpg
+
+### MacOS build issues with OpenSSL
+
+* if necessary to complete the build, install latest OpenSSL on MacOS
+
+```
+brew update
+brew upgrade openssl
+```
+
+* additional dependency-related build steps on MacOS as necessary:
+
+```
+export CPPFLAGS="-I/usr/local/opt/openssl/include $CPPFLAGS"
+brew install automake
+export LDFLAGS="-L/usr/local/opt/openssl/lib"
+brew install libtool
+```
 
 
 ## How To
